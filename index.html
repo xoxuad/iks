@@ -4399,22 +4399,40 @@
      * TD   = MTBF / (MTBF + MTTR)  expressed as %
      * IPR  = MTBF / MTTR
      */
-    function computeAdvancedKPIs(records) {
-      // ── MTTR: only closed tickets with both startedAt and closedAt ──
-      var repairTimes = records.filter(function(r) {
+    /**
+     * computeAdvancedKPIs(allRecords, monthRecords)
+     *
+     * Scopes MTTR and MTBF to the selected month:
+     *   - MTTR : average repair time (startedAt->closedAt) of tickets created in the month.
+     *   - MTBF : for each machine, inter-failure intervals where the NEXT failure falls
+     *            in the selected month. We look up the previous failure from the full
+     *            dataset so we always have a valid "repair-end" anchor.
+     *   - TD   = MTBF / (MTBF + MTTR) x 100
+     *   - IPR  = MTBF / MTTR
+     */
+    function computeAdvancedKPIs(allRecords, monthRecords) {
+      // Fall back to full dataset when no month slice is supplied
+      var scopeRecords = (monthRecords && monthRecords.length) ? monthRecords : allRecords;
+
+      // ── MTTR : closed tickets in the selected month ──
+      var repairTimes = scopeRecords.filter(function(r) {
         return r.startedAt && r.closedAt && r.closedAt > r.startedAt;
       }).map(function(r) {
-        return r.closedAt - r.startedAt; // ms
+        return r.closedAt - r.startedAt;
       });
 
       var mttrMs = repairTimes.length
         ? Math.round(repairTimes.reduce(function(s, v) { return s + v; }, 0) / repairTimes.length)
         : 0;
 
-      // ── MTBF: per-machine inter-failure operating intervals ──
-      // Group by machine, sort by createdAt, compute intervals between repair-end → next failure
+      // ── MTBF : inter-failure intervals anchored to the selected month ──
+      // Build a set of IDs from scopeRecords for quick lookup
+      var scopeIds = {};
+      scopeRecords.forEach(function(r) { if (r.id) scopeIds[r.id] = true; });
+
+      // Build full per-machine sorted timeline from allRecords
       var byMachine = {};
-      records.forEach(function(r) {
+      allRecords.forEach(function(r) {
         if (!r.machine || !r.createdAt) return;
         if (!byMachine[r.machine]) byMachine[r.machine] = [];
         byMachine[r.machine].push(r);
@@ -4424,10 +4442,11 @@
       Object.keys(byMachine).forEach(function(machine) {
         var sorted = byMachine[machine].slice().sort(function(a, b) { return a.createdAt - b.createdAt; });
         for (var i = 1; i < sorted.length; i++) {
-          // Operating time = time from previous repair end (closedAt) to next failure (createdAt)
-          var prevEnd = sorted[i - 1].closedAt || sorted[i - 1].createdAt;
-          var nextFail = sorted[i].createdAt;
-          var interval = nextFail - prevEnd;
+          var nextRecord = sorted[i];
+          // Only count intervals where the next failure belongs to the selected month
+          if (scopeRecords !== allRecords && !scopeIds[nextRecord.id]) continue;
+          var prevEnd  = sorted[i - 1].closedAt || sorted[i - 1].createdAt;
+          var interval = nextRecord.createdAt - prevEnd;
           if (interval > 0) allOperatingIntervals.push(interval);
         }
       });
@@ -4437,10 +4456,17 @@
         : 0;
 
       // ── TD and IPR ──
-      var tdPct  = (mtbfMs && mttrMs) ? (mtbfMs / (mtbfMs + mttrMs)) * 100 : (mtbfMs ? 100 : 0);
-      var ipr    = (mtbfMs && mttrMs) ? mtbfMs / mttrMs : 0;
+      // Use null to distinguish "not enough data" from a genuine 0 value
+      var tdPct = (mtbfMs && mttrMs) ? (mtbfMs / (mtbfMs + mttrMs)) * 100
+                : (mtbfMs ? 100 : null);
+      var ipr   = (mtbfMs && mttrMs) ? mtbfMs / mttrMs : null;
 
-      return { mtbfMs: mtbfMs, mttrMs: mttrMs, tdPct: tdPct, ipr: ipr };
+      return {
+        mtbfMs: mtbfMs || null,
+        mttrMs: mttrMs || null,
+        tdPct:  tdPct,
+        ipr:    ipr
+      };
     }
 
     /**
@@ -4497,12 +4523,13 @@
           }
         }
 
-        var tdPct = (mtbfMs && mttrMs) ? (mtbfMs / (mtbfMs + mttrMs)) * 100 : (mtbfMs ? 100 : 0);
-        var ipr   = (mtbfMs && mttrMs) ? mtbfMs / mttrMs : 0;
+        var tdPct = (mtbfMs && mttrMs) ? (mtbfMs / (mtbfMs + mttrMs)) * 100
+                   : (mtbfMs ? 100 : null);
+        var ipr   = (mtbfMs && mttrMs) ? mtbfMs / mttrMs : null;
 
         result[machine] = {
-          mtbfMs: mtbfMs,
-          mttrMs: mttrMs,
+          mtbfMs: mtbfMs || null,
+          mttrMs: mttrMs || null,
           tdPct: tdPct,
           ipr: ipr,
           failureCount: sorted.length,
@@ -4548,6 +4575,7 @@
      *  TD < 70%        → "Maintenance urgente"   (red)
      */
     function getMachineHealthStatus(tdPct) {
+      if (tdPct == null) return { label: 'Données insuffisantes', cssClass: 'health-chip' };
       if (tdPct >= 90) return { label: 'Bonne disponibilité', cssClass: 'health-chip health-good' };
       if (tdPct >= 70) return { label: 'Surveillance requise', cssClass: 'health-chip health-warn' };
       return { label: 'Maintenance urgente', cssClass: 'health-chip health-urgent' };
@@ -4921,18 +4949,18 @@
       byId('indicatorTopMachinesTitle').textContent = 'Machines anormales - ' + formatMonthLabel(referenceDate);
 
       // ── New advanced KPIs ──────────────────────────────────────────────
-      var advKpi = computeAdvancedKPIs(indicatorRecords);
-      byId('indicatorMTBF').textContent = advKpi.mtbfMs ? formatDurationSmart(advKpi.mtbfMs) : '—';
-      byId('indicatorMTTR').textContent = advKpi.mttrMs ? formatDurationSmart(advKpi.mttrMs) : '—';
-      byId('indicatorTD').textContent   = advKpi.tdPct  ? advKpi.tdPct.toFixed(1) + ' %'     : '—';
-      byId('indicatorIPR').textContent  = advKpi.ipr    ? advKpi.ipr.toFixed(2)               : '—';
+      var advKpi = computeAdvancedKPIs(indicatorRecords, referenceMonthRecords);
+      byId('indicatorMTBF').textContent = advKpi.mtbfMs != null ? formatDurationSmart(advKpi.mtbfMs) : '—';
+      byId('indicatorMTTR').textContent = advKpi.mttrMs != null ? formatDurationSmart(advKpi.mttrMs) : '—';
+      byId('indicatorTD').textContent   = advKpi.tdPct  != null ? advKpi.tdPct.toFixed(1) + ' %'     : '—';
+      byId('indicatorIPR').textContent  = advKpi.ipr    != null ? advKpi.ipr.toFixed(2)               : '—';
 
       // Color the TD value by health threshold
       var tdEl = byId('indicatorTD');
-      if (advKpi.tdPct >= 90)      { tdEl.style.color = '#15803d'; }
-      else if (advKpi.tdPct >= 70) { tdEl.style.color = '#b45309'; }
-      else if (advKpi.tdPct > 0)   { tdEl.style.color = '#b91c1c'; }
-      else                         { tdEl.style.color = ''; }
+      if (advKpi.tdPct == null)         { tdEl.style.color = ''; }
+      else if (advKpi.tdPct >= 90)      { tdEl.style.color = '#15803d'; }
+      else if (advKpi.tdPct >= 70)      { tdEl.style.color = '#b45309'; }
+      else                              { tdEl.style.color = '#b91c1c'; }
 
       byId('indicatorDailyChart').innerHTML = referenceMonthRecords.length
         ? dailyBuckets.map(function(day) {
@@ -4988,10 +5016,10 @@
       byId('indicatorTopMachines').innerHTML = abnormalMachines.length
         ? abnormalMachines.map(function(item, index) {
             var mkpi     = machineKpiMap[item.label];
-            var health   = mkpi && mkpi.tdPct   ? getMachineHealthStatus(mkpi.tdPct)                              : null;
+            var health   = mkpi && mkpi.tdPct != null ? getMachineHealthStatus(mkpi.tdPct)                              : null;
             var decision = mkpi                  ? getMachineMaintenanceDecision(mkpi, advKpi.mtbfMs, advKpi.mttrMs) : null;
-            var tdText   = mkpi && mkpi.tdPct   ? mkpi.tdPct.toFixed(1) + '%'  : null;
-            var mtbfText = mkpi && mkpi.mtbfMs  ? formatDurationSmart(mkpi.mtbfMs) : null;
+            var tdText   = mkpi && mkpi.tdPct != null ? mkpi.tdPct.toFixed(1) + '%'  : null;
+            var mtbfText = mkpi && mkpi.mtbfMs != null ? formatDurationSmart(mkpi.mtbfMs) : null;
             var baselineText = item.baseline
               ? item.baseline.toFixed(1).replace('.', ',') + ' / mois en moyenne'
               : 'pas d\'historique antérieur';
